@@ -1,129 +1,153 @@
-library ieee;
-use ieee.std_logic_1164.all;
-use ieee.numeric_std.all;
+#include <stdio.h>
+#include "platform.h"
+#include "xil_printf.h"
+#include "xgpio.h"
+#include "xparameters.h"
+#include <stdint.h>
 
-entity conv is
-    generic (
-        N            : integer := 40;
-        INDEX_WIDTH  : integer := 6
-    );
-    port (
-        clk     : in  std_logic;
-        rst     : in  std_logic;
+// ---------------- GPIO IDs ----------------
+#define GPIO_DATA_ID     XPAR_AXI_GPIO_0_DEVICE_ID
+#define GPIO_OUT_ID      XPAR_AXI_GPIO_1_DEVICE_ID
+#define GPIO_START_ID    XPAR_AXI_GPIO_2_DEVICE_ID
+#define GPIO_WRITE_ID    XPAR_AXI_GPIO_3_DEVICE_ID
+#define GPIO_INDEX_ID    XPAR_AXI_GPIO_4_DEVICE_ID
+#define GPIO_CLEAR_ID    XPAR_AXI_GPIO_5_DEVICE_ID
 
-        -- Software write interface
-        write_en      : in  std_logic;
-        write_index   : in  unsigned(INDEX_WIDTH-1 downto 0);
-        x_in          : in  signed(7 downto 0);
-        w_in          : in  signed(7 downto 0);
+// ---------------- Channels ----------------
+#define X_CH        1
+#define W_CH        2
+#define RESULT_CH   1
+#define DONE_CH     2
+#define START_CH    1
+#define WRITE_CH    1
+#define INDEX_CH    1
+#define CLEAR_CH    1
 
-        -- Start compute
-        start       : in  std_logic;
-        clear_done  : in  std_logic;
+#define N 40
 
-        -- 32-bit signed result
-        result  : out signed(31 downto 0);
-        done    : out std_logic
-    );
-end entity;
+XGpio gpio_data;
+XGpio gpio_out;
+XGpio gpio_start;
+XGpio gpio_write;
+XGpio gpio_index;
+XGpio gpio_clear;
 
-architecture rtl of conv is
+// ------------------------------------------------
+// Load Memory
+// ------------------------------------------------
+void load_memory(int8_t x_vals[], int8_t w_vals[])
+{
+    XGpio_DiscreteWrite(&gpio_write, WRITE_CH, 1);
 
-    type state_type is (IDLE, COMPUTE);
-    signal state : state_type := IDLE;
+    for(int i = 0; i < N; i++)
+    {
+        XGpio_DiscreteWrite(&gpio_index, INDEX_CH, i);
+        XGpio_DiscreteWrite(&gpio_data, X_CH, (uint32_t)(x_vals[i] & 0xFF));
+        XGpio_DiscreteWrite(&gpio_data, W_CH, (uint32_t)(w_vals[i] & 0xFF));
+    }
 
-    type mem_t is array (0 to N-1) of signed(7 downto 0);
-    signal x_mem : mem_t := (others => (others => '0'));
-    signal w_mem : mem_t := (others => (others => '0'));
+    XGpio_DiscreteWrite(&gpio_write, WRITE_CH, 0);
+}
 
-    -- 32-bit accumulator
-    signal acc        : signed(31 downto 0) := (others => '0');
-    signal comp_index : integer range 0 to N := 0;
-    signal done_r     : std_logic := '0';
+// ------------------------------------------------
+// Start + Wait + Read (32-bit signed)
+// ------------------------------------------------
+int32_t run_accelerator()
+{
+    int done = 0;
 
-begin
+    XGpio_DiscreteWrite(&gpio_start, START_CH, 1);
+    XGpio_DiscreteWrite(&gpio_start, START_CH, 0);
 
-    process(clk)
-        variable mult_sum  : signed(31 downto 0);
-        variable m0,m1,m2,m3,m4,m5,m6,m7 : signed(15 downto 0);
-    begin
-        if rising_edge(clk) then
+    while(!done)
+    {
+        done = XGpio_DiscreteRead(&gpio_out, DONE_CH) & 0x1;
+    }
 
-            if rst = '0' then
-                state      <= IDLE;
-                acc        <= (others => '0');
-                comp_index <= 0;
-                done_r     <= '0';
+    // Read full 32-bit result
+    uint32_t raw = XGpio_DiscreteRead(&gpio_out, RESULT_CH);
+    int32_t result = (int32_t)raw;   // Proper signed cast
 
-            else
+    // Clear done
+    XGpio_DiscreteWrite(&gpio_clear, CLEAR_CH, 1);
+    XGpio_DiscreteWrite(&gpio_clear, CLEAR_CH, 0);
 
-                case state is
+    return result;
+}
 
-                ------------------------------------------------
-                when IDLE =>
+// ------------------------------------------------
+// MAIN
+// ------------------------------------------------
+int main()
+{
+    init_platform();
+    xil_printf("\n==== Convolution (32-bit Signed) ====\n");
 
-                    -- Memory write
-                    if write_en = '1' then
-                        if to_integer(write_index) < N then
-                            x_mem(to_integer(write_index)) <= x_in;
-                            w_mem(to_integer(write_index)) <= w_in;
-                        end if;
-                    end if;
+    // Initialize GPIOs
+    XGpio_Initialize(&gpio_data,  GPIO_DATA_ID);
+    XGpio_Initialize(&gpio_out,   GPIO_OUT_ID);
+    XGpio_Initialize(&gpio_start, GPIO_START_ID);
+    XGpio_Initialize(&gpio_write, GPIO_WRITE_ID);
+    XGpio_Initialize(&gpio_index, GPIO_INDEX_ID);
+    XGpio_Initialize(&gpio_clear, GPIO_CLEAR_ID);
 
-                    -- Clear done
-                    if clear_done = '1' then
-                        done_r <= '0';
-                    end if;
+    XGpio_SetDataDirection(&gpio_data, X_CH, 0x0);
+    XGpio_SetDataDirection(&gpio_data, W_CH, 0x0);
+    XGpio_SetDataDirection(&gpio_out, RESULT_CH, 0xFFFFFFFF);
+    XGpio_SetDataDirection(&gpio_out, DONE_CH, 0xFFFFFFFF);
+    XGpio_SetDataDirection(&gpio_start, START_CH, 0x0);
+    XGpio_SetDataDirection(&gpio_write, WRITE_CH, 0x0);
+    XGpio_SetDataDirection(&gpio_index, INDEX_CH, 0x0);
+    XGpio_SetDataDirection(&gpio_clear, CLEAR_CH, 0x0);
 
-                    -- Start compute
-                    if start = '1' then
-                        acc        <= (others => '0');
-                        comp_index <= 0;
-                        state      <= COMPUTE;
-                    end if;
+    int8_t x[N];
+    int8_t w[N];
+    int32_t expected;
+    int32_t result;
 
-                ------------------------------------------------
-                when COMPUTE =>
+    // ================= TEST 1 =================
+    xil_printf("\nTest 1: x=1..40, w=1\n");
+    expected = 0;
+    for(int i=0;i<N;i++)
+    {
+        x[i] = i+1;
+        w[i] = 1;
+        expected += (int32_t)x[i] * (int32_t)w[i];
+    }
+    load_memory(x,w);
+    result = run_accelerator();
+    xil_printf("Expected = %ld | Result = %ld\n", expected, result);
+    xil_printf(result == expected ? "PASS\n" : "FAIL\n");
 
-                    -- 8 parallel 8x8 multiplications (16-bit each)
-                    m0 := x_mem(comp_index)     * w_mem(comp_index);
-                    m1 := x_mem(comp_index + 1) * w_mem(comp_index + 1);
-                    m2 := x_mem(comp_index + 2) * w_mem(comp_index + 2);
-                    m3 := x_mem(comp_index + 3) * w_mem(comp_index + 3);
-                    m4 := x_mem(comp_index + 4) * w_mem(comp_index + 4);
-                    m5 := x_mem(comp_index + 5) * w_mem(comp_index + 5);
-                    m6 := x_mem(comp_index + 6) * w_mem(comp_index + 6);
-                    m7 := x_mem(comp_index + 7) * w_mem(comp_index + 7);
+    // ================= TEST 2 =================
+    xil_printf("\nTest 2: x=2, w=3\n");
+    expected = 0;
+    for(int i=0;i<N;i++)
+    {
+        x[i] = 2;
+        w[i] = 3;
+        expected += (int32_t)x[i] * (int32_t)w[i];
+    }
+    load_memory(x,w);
+    result = run_accelerator();
+    xil_printf("Expected = %ld | Result = %ld\n", expected, result);
+    xil_printf(result == expected ? "PASS\n" : "FAIL\n");
 
-                    -- Extend to 32-bit and sum
-                    mult_sum :=
-                        resize(m0, 32) +
-                        resize(m1, 32) +
-                        resize(m2, 32) +
-                        resize(m3, 32) +
-                        resize(m4, 32) +
-                        resize(m5, 32) +
-                        resize(m6, 32) +
-                        resize(m7, 32);
+    // ================= TEST 3 =================
+    xil_printf("\nTest 3: x=i, w=i\n");
+    expected = 0;
+    for(int i=0;i<N;i++)
+    {
+        x[i] = -4;
+        w[i] = 4;
+        expected += -4*4;
+    }
+    load_memory(x,w);
+    result = run_accelerator();
+    xil_printf("Expected = %ld | Result = %ld\n", expected, result);
+    xil_printf(result == expected ? "PASS\n" : "FAIL\n");
 
-                    -- Accumulate into 32-bit accumulator
-                    acc <= acc + mult_sum;
+    xil_printf("\n==== All Tests Finished ====\n");
 
-                    -- Done condition
-                    if comp_index = N-8 then
-                        done_r <= '1';
-                        state  <= IDLE;
-                    else
-                        comp_index <= comp_index + 8;
-                    end if;
-
-                end case;
-
-            end if;
-        end if;
-    end process;
-
-    result <= acc;
-    done   <= done_r;
-
-end architecture;
+    while(1);
+}
